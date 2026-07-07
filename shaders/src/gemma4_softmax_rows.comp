@@ -1,0 +1,67 @@
+#version 450
+
+// Gemma4.pas row-wise softmax, in-place, numerically stable
+// Each row of row_size elements gets an independent softmax:
+//   row[i] = exp(row[i] - max(row)) / sum(exp(row[j] - max(row)))
+//
+// Dispatch: (num_rows, 1, 1) workgroups - one workgroup per row
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint row_size;
+    uint num_rows;
+};
+
+layout(set = 0, binding = 0) buffer DataBuf {
+    float data[];
+};
+
+shared float shared_data[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= num_rows) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * row_size;
+
+    // Pass 1: row maximum
+    float local_max = -3.402823466e+38;
+    for (uint i = tid; i < row_size; i += 256u) {
+        local_max = max(local_max, data[base + i]);
+    }
+    shared_data[tid] = local_max;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            shared_data[tid] = max(shared_data[tid], shared_data[tid + s]);
+        }
+        barrier();
+    }
+    float row_max = shared_data[0];
+    barrier();
+
+    // Pass 2: exponentiate in-place and accumulate sum
+    float local_sum = 0.0;
+    for (uint i = tid; i < row_size; i += 256u) {
+        float e = exp(data[base + i] - row_max);
+        data[base + i] = e;
+        local_sum += e;
+    }
+    shared_data[tid] = local_sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            shared_data[tid] += shared_data[tid + s];
+        }
+        barrier();
+    }
+    float inv_sum = 1.0 / shared_data[0];
+    barrier();
+
+    // Pass 3: normalize
+    for (uint i = tid; i < row_size; i += 256u) {
+        data[base + i] *= inv_sum;
+    }
+}

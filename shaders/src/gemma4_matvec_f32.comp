@@ -1,0 +1,51 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
+
+// Gemma4.pas F32 matrix-vector multiply -- vec4 loads, multi-row workgroups.
+// Weight rows are 16-byte aligned (upload-time layout); ncols must be a
+// multiple of 4 (2560 / 10240 / 256 all qualify).
+//
+// Dispatch: ceil(nrows / 8) workgroups
+
+layout(local_size_x = 32, local_size_y = 8) in;
+
+layout(push_constant) uniform PushConstants {
+    uint ncols;
+    uint nrows;
+    uint weight_vec4_offset;  // vec4-element offset within the bound range
+    uint reserved;
+};
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf {
+    vec4 weights[];
+};
+
+layout(set = 0, binding = 1) readonly buffer InputBuf {
+    vec4 input_vec[];
+};
+
+layout(set = 0, binding = 2) buffer OutputBuf {
+    float output_vec[];
+};
+
+void main() {
+    uint row = gl_WorkGroupID.x * 8u + gl_LocalInvocationID.y;
+    uint lane = gl_LocalInvocationID.x;
+    uint vecs_per_row = ncols / 4u;
+
+    float sum = 0.0;
+
+    if (row < nrows) {
+        uint row_off = weight_vec4_offset + row * vecs_per_row;
+        for (uint i = lane; i < vecs_per_row; i += 32u) {
+            sum += dot(weights[row_off + i], input_vec[i]);
+        }
+    }
+
+    sum = subgroupClusteredAdd(sum, 32u);
+
+    if (row < nrows && lane == 0u) {
+        output_vec[row] = sum;
+    }
+}

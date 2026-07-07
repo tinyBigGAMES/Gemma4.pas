@@ -1,0 +1,38 @@
+#version 450
+
+// Gemma4.pas batched KV ring append.
+// Copies batch staged entries [batch x kv_stride] into ring slots
+// (base_position + m) % ring_entries of the cache in one dispatch,
+// replacing per-entry RecordCopy calls.
+//
+// One invocation per staged element.
+// Dispatch: ceil(batch * kv_stride / 64) workgroups
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint kv_stride;
+    uint batch;
+    uint base_position;
+    uint ring_entries;
+};
+
+layout(set = 0, binding = 0) writeonly restrict buffer CacheBuf {
+    float cache_data[];
+};
+
+layout(set = 0, binding = 1) readonly restrict buffer StageBuf {
+    float stage[];
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = batch * kv_stride;
+    if (idx >= total) return;
+
+    uint m = idx / kv_stride;
+    uint e = idx % kv_stride;
+    uint slot = (base_position + m) % ring_entries;
+
+    cache_data[slot * kv_stride + e] = stage[m * kv_stride + e];
+}

@@ -1,0 +1,59 @@
+#version 450
+
+// Gemma4.pas attention scores
+// For each (query head h, cache entry t):
+//   scores[h * seq_len + t] = dot(q[h*head_dim ..], k_entry(t)[kv_head(h)*head_dim ..])
+// where kv_head(h) = h / (num_heads / num_kv_heads)  (GQA)
+// and k_entry index = (cache_pos0 + t) % ring_size.
+//
+// Attention scaling = 1.0 (Gemma 4, bible). NO softcap. Causal masking is
+// implicit: the CPU only exposes valid cached entries via seq_len.
+//
+// One invocation per (head, entry).
+// Dispatch: ceil(num_heads * seq_len / 64) workgroups
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint head_dim;
+    uint num_heads;
+    uint num_kv_heads;
+    uint kv_stride;
+    uint seq_len;
+    uint ring_size;
+    uint cache_pos0;
+};
+
+layout(set = 0, binding = 0) readonly buffer QBuf {
+    float q[];
+};
+
+layout(set = 0, binding = 1) readonly buffer KCacheBuf {
+    float kcache[];
+};
+
+layout(set = 0, binding = 2) buffer ScoresBuf {
+    float scores[];
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = num_heads * seq_len;
+    if (idx >= total) return;
+
+    uint head = idx / seq_len;
+    uint t = idx % seq_len;
+
+    uint kv_head = head / (num_heads / num_kv_heads);
+    uint entry = (cache_pos0 + t) % ring_size;
+    uint k_base = entry * kv_stride + kv_head * head_dim;
+    uint q_base = head * head_dim;
+
+    float sum = 0.0;
+    for (uint d = 0u; d < head_dim; d++) {
+        sum += q[q_base + d] * kcache[k_base + d];
+    }
+
+    // Scale = 1.0 for Gemma 4 - no sqrt(head_dim) divide, no softcap
+    scores[head * seq_len + t] = sum;
+}

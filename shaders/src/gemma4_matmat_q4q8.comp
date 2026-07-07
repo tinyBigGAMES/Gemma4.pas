@@ -1,0 +1,146 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
+#extension GL_EXT_integer_dot_product : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// Q4_0 weights x Q8_1 activations, MATRIX-matrix (batched positions),
+// with shared-memory staging of the Q8 activation tile.
+//
+// Same split-plane weight layout and per-block math as gemma4_matvec_q4q8:
+//   contribution = d4 * (d8 * sdot(nib, q8) - 8 * s8)
+//
+// Tiling: workgroup = 8 output rows (y lanes) x M_TILE=8 positions
+// (gl_WorkGroupID.y), 32 x-lanes striding the block dimension.
+// Per 32-block chunk, ALL 256 threads cooperatively stage the
+// [8 positions x 32 blocks] Q8 tile into shared memory (one (m,b) cell
+// per thread: 2 uvec4 loads + 1 pre-unpacked vec2), then every row-lane
+// reads activations from LDS. This removes the 8x cross-warp redundancy
+// of the previous version, where each y-lane issued the same 8 scalar
+// global loads per block per position.
+//
+// Bindings, push constants, dispatch geometry, and output layout are
+// IDENTICAL to the previous version -- no host-side change.
+//
+// Q8 layout (written by gemma4_quantize_q8 over a contiguous
+// [batch x ncols] input): uvec4 index = block*2 + w, ds index = block,
+// where block = m * (ncols/32) + b.
+// Output is position-major: output[m * nrows + row].
+//
+// Dispatch: (ceil(nrows / 8), ceil(batch / 8), 1) workgroups
+
+layout(local_size_x = 32, local_size_y = 8) in;
+
+layout(push_constant) uniform PushConstants {
+    uint ncols;
+    uint nrows;
+    uint quants_vec4_offset;
+    uint scales_word_offset;
+    uint batch;
+};
+
+layout(set = 0, binding = 0) readonly restrict buffer QuantsBuf {
+    uvec4 quants[];
+};
+
+layout(set = 0, binding = 1) readonly restrict buffer ScalesBuf {
+    uint scales[];
+};
+
+layout(set = 0, binding = 2) readonly restrict buffer Q8QsBuf {
+    uvec4 q8qs4[];
+};
+
+layout(set = 0, binding = 3) readonly restrict buffer Q8DsBuf {
+    uint q8ds[];
+};
+
+layout(set = 0, binding = 4) writeonly restrict buffer OutputBuf {
+    float output_mat[];
+};
+
+// Staged Q8 tile: 8 positions x 32 blocks
+shared uvec4 sh_qs[8][32][2];  // 8192 B: int8 quants, 32 B per block
+shared vec2 sh_ds[8][32];      // 2048 B: (d8, s8) per block
+
+void main() {
+    uint row = gl_WorkGroupID.x * 8u + gl_LocalInvocationID.y;
+    uint lane = gl_LocalInvocationID.x;
+    uint yi = gl_LocalInvocationID.y;
+    uint mbase = gl_WorkGroupID.y * 8u;
+    uint blocks_per_row = ncols / 32u;
+    uint nchunks = (blocks_per_row + 31u) / 32u;
+
+    float acc[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+
+    for (uint bc = 0u; bc < nchunks; bc++) {
+        uint b = bc * 32u + lane;
+
+        // --- Stage: thread (lane, yi) loads Q8 cell (m = mbase+yi, b) ---
+        {
+            uint sm = mbase + yi;
+            if (sm < batch && b < blocks_per_row) {
+                uint mblk = sm * blocks_per_row + b;
+                sh_qs[yi][lane][0] = q8qs4[mblk * 2u];
+                sh_qs[yi][lane][1] = q8qs4[mblk * 2u + 1u];
+                sh_ds[yi][lane] = unpackHalf2x16(q8ds[mblk]);
+            }
+        }
+
+        barrier();
+
+        // --- Compute: row-lane dots its weight block against 8 positions ---
+        if (row < nrows && b < blocks_per_row) {
+            uint blk = row * blocks_per_row + b;
+
+            // Load the weight block ONCE for all 8 positions
+            uvec4 q = quants[quants_vec4_offset + blk];
+            uint sw = scales[scales_word_offset + (blk >> 1u)];
+            float d4 = ((blk & 1u) == 0u)
+                ? unpackHalf2x16(sw).x
+                : unpackHalf2x16(sw).y;
+
+            // Expand nibble planes once (positive as signed bytes: exact)
+            int lo0 = int(q.x & 0x0F0F0F0Fu);
+            int lo1 = int(q.y & 0x0F0F0F0Fu);
+            int lo2 = int(q.z & 0x0F0F0F0Fu);
+            int lo3 = int(q.w & 0x0F0F0F0Fu);
+            int hi0 = int((q.x >> 4u) & 0x0F0F0F0Fu);
+            int hi1 = int((q.y >> 4u) & 0x0F0F0F0Fu);
+            int hi2 = int((q.z >> 4u) & 0x0F0F0F0Fu);
+            int hi3 = int((q.w >> 4u) & 0x0F0F0F0Fu);
+
+            [[unroll]] for (uint mt = 0u; mt < 8u; mt++) {
+                if (mbase + mt < batch) {
+                    uvec4 v0 = sh_qs[mt][lane][0];
+                    uvec4 v1 = sh_qs[mt][lane][1];
+                    vec2 dsb = sh_ds[mt][lane];
+
+                    int idot = 0;
+                    idot += dotPacked4x8EXT(lo0, int(v0.x));
+                    idot += dotPacked4x8EXT(lo1, int(v0.y));
+                    idot += dotPacked4x8EXT(lo2, int(v0.z));
+                    idot += dotPacked4x8EXT(lo3, int(v0.w));
+                    idot += dotPacked4x8EXT(hi0, int(v1.x));
+                    idot += dotPacked4x8EXT(hi1, int(v1.y));
+                    idot += dotPacked4x8EXT(hi2, int(v1.z));
+                    idot += dotPacked4x8EXT(hi3, int(v1.w));
+
+                    acc[mt] += d4 * (dsb.x * float(idot) - 8.0 * dsb.y);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Reduce each position's partial across the 32-lane row cluster.
+    // Uniform loop: ALL invocations execute all 8 clustered adds.
+    [[unroll]] for (uint mt = 0u; mt < 8u; mt++) {
+        float s = subgroupClusteredAdd(acc[mt], 32u);
+        uint m = mbase + mt;
+        if (row < nrows && lane == 0u && m < batch) {
+            output_mat[m * nrows + row] = s;
+        }
+    }
+}

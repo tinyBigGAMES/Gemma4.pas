@@ -1,0 +1,62 @@
+#version 450
+
+// Gemma4.pas custom RMS normalization
+// Computes: dst[i] = (src[i] / rms) * weight[weight_offset + i]
+// where rms = sqrt(mean(src^2) + eps)
+// weight_offset is a float-element offset into the bound weight buffer,
+// allowing norm weights to be read directly from the big weight blob.
+//
+// Dispatch: single workgroup (1, 1, 1)
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint size;
+    uint weight_offset;
+    float eps;
+};
+
+layout(set = 0, binding = 0) readonly buffer SrcBuf {
+    float src[];
+};
+
+layout(set = 0, binding = 1) readonly buffer WeightBuf {
+    float weight[];
+};
+
+layout(set = 0, binding = 2) buffer DstBuf {
+    float dst[];
+};
+
+shared float shared_data[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    // Pass 1: Compute sum of squares
+    float sum_sq = 0.0;
+    for (uint i = tid; i < size; i += 256) {
+        float val = src[i];
+        sum_sq += val * val;
+    }
+
+    shared_data[tid] = sum_sq;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_data[tid] += shared_data[tid + s];
+        }
+        barrier();
+    }
+
+    // All threads read the total
+    float inv_rms = 1.0 / sqrt(shared_data[0] / float(size) + eps);
+
+    barrier();
+
+    // Pass 2: Normalize and scale by weight
+    for (uint i = tid; i < size; i += 256) {
+        dst[i] = src[i] * inv_rms * weight[weight_offset + i];
+    }
+}

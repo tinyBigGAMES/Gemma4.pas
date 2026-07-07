@@ -1,0 +1,51 @@
+#version 450
+
+// Gemma4.pas RoPE - NEOX half-split rotation, in-place, multi-head
+// Matches CpuApplyRoPE (Gemma4.Attention.pas) exactly:
+//   pairing offset is ALWAYS head_dim/2
+//   only the first rot_angles pairs rotate (zero-frequency pairs pass through)
+//   freq for pair i: 1 / theta^(2i / head_dim)  (divide by FULL head_dim)
+//   out[i]        = x[i] * cos - x[i+half] * sin
+//   out[i + half] = x[i+half] * cos + x[i] * sin
+//
+// One invocation per (head, angle pair).
+// Dispatch: ceil(num_heads * head_dim/2 / 64) workgroups
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint position;
+    uint head_dim;
+    uint rot_angles;
+    uint num_heads;
+    float theta;
+};
+
+layout(set = 0, binding = 0) buffer DataBuf {
+    float data[];
+};
+
+void main() {
+    uint half_dim = head_dim / 2u;
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = num_heads * half_dim;
+    if (idx >= total) return;
+
+    uint head = idx / half_dim;
+    uint pair = idx % half_dim;
+
+    // Pairs at or beyond rot_angles are zero-frequency: identity pass-through
+    if (pair >= rot_angles) return;
+
+    float freq = 1.0 / pow(theta, float(pair * 2u) / float(head_dim));
+    float angle = float(position) * freq;
+    float c = cos(angle);
+    float s = sin(angle);
+
+    uint base = head * head_dim;
+    float x0 = data[base + pair];
+    float x1 = data[base + pair + half_dim];
+
+    data[base + pair] = x0 * c - x1 * s;
+    data[base + pair + half_dim] = x1 * c + x0 * s;
+}

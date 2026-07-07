@@ -1,0 +1,54 @@
+#version 450
+
+// Gemma4.pas attention output (weighted value sum)
+// For each (query head h, dim d):
+//   out[h * head_dim + d] = sum_t probs[h * seq_len + t] * v_entry(t)[kv_head(h)*head_dim + d]
+// where kv_head(h) = h / (num_heads / num_kv_heads)  (GQA)
+// and v_entry index = (cache_pos0 + t) % ring_size.
+//
+// One invocation per (head, dim).
+// Dispatch: ceil(num_heads * head_dim / 64) workgroups
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint head_dim;
+    uint num_heads;
+    uint num_kv_heads;
+    uint kv_stride;
+    uint seq_len;
+    uint ring_size;
+    uint cache_pos0;
+};
+
+layout(set = 0, binding = 0) readonly buffer ProbsBuf {
+    float probs[];
+};
+
+layout(set = 0, binding = 1) readonly buffer VCacheBuf {
+    float vcache[];
+};
+
+layout(set = 0, binding = 2) buffer OutBuf {
+    float out_vec[];
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = num_heads * head_dim;
+    if (idx >= total) return;
+
+    uint head = idx / head_dim;
+    uint d = idx % head_dim;
+
+    uint kv_head = head / (num_heads / num_kv_heads);
+    uint v_off = kv_head * head_dim + d;
+
+    float sum = 0.0;
+    for (uint t = 0u; t < seq_len; t++) {
+        uint entry = (cache_pos0 + t) % ring_size;
+        sum += probs[head * seq_len + t] * vcache[entry * kv_stride + v_off];
+    }
+
+    out_vec[head * head_dim + d] = sum;
+}

@@ -1,0 +1,29 @@
+#version 450
+
+// Gemma4.pas strided buffer copy
+// Computes: dst[dst_offset + i] = src[src_offset + i]
+// Used for embedding -> hidden copy and KV cache ring append.
+//
+// Dispatch: ceil(count / 256) workgroups
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint count;
+    uint src_offset;
+    uint dst_offset;
+};
+
+layout(set = 0, binding = 0) buffer DstBuf {
+    float dst[];
+};
+
+layout(set = 0, binding = 1) readonly buffer SrcBuf {
+    float src[];
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= count) return;
+    dst[dst_offset + i] = src[src_offset + i];
+}

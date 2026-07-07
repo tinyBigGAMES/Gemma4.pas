@@ -1,0 +1,71 @@
+#version 450
+
+// Bidirectional attention output (weighted value sum), t-split.
+// One workgroup = 32 consecutive output dims for one (position, head);
+// y-slices split the key range 8 ways, 1 KB shared reduction.
+// Iterates ALL t 0..seq_len-1: masked probabilities are EXACTLY 0 after
+// softmax and V is fully populated for the whole sequence (no ring, no
+// uninitialized slots), so unconditional iteration is safe here.
+// V layout: [seq x kv_stride]. out[(m * num_heads + head) * head_dim + d].
+//
+// Dispatch: seq_len * num_heads * (head_dim / 32) workgroups
+
+layout(local_size_x = 32, local_size_y = 8) in;
+
+layout(push_constant) uniform PushConstants {
+    uint head_dim;
+    uint num_heads;
+    uint num_kv_heads;
+    uint kv_stride;
+    uint seq_len;
+    uint window_size;
+    float scale;
+    uint row_pitch;
+};
+
+layout(set = 0, binding = 0) readonly buffer ProbsBuf {
+    float probs[];
+};
+
+layout(set = 0, binding = 1) readonly buffer VBuf {
+    float vbuf[];
+};
+
+layout(set = 0, binding = 2) buffer OutBuf {
+    float out_mat[];
+};
+
+shared float sh_part[8][32];
+
+void main() {
+    uint dblocks = head_dim / 32u;
+    uint wg = gl_WorkGroupID.x;
+    uint m = wg / (num_heads * dblocks);
+    uint rem = wg % (num_heads * dblocks);
+    uint head = rem / dblocks;
+    uint dblk = rem % dblocks;
+
+    uint x = gl_LocalInvocationID.x;
+    uint y = gl_LocalInvocationID.y;
+    uint d = dblk * 32u + x;
+
+    uint kv_head = head / (num_heads / num_kv_heads);
+    uint v_off = kv_head * head_dim + d;
+    uint prob_base = (m * num_heads + head) * row_pitch;
+
+    float partial = 0.0;
+    for (uint t = y; t < seq_len; t += 8u) {
+        partial += probs[prob_base + t] * vbuf[t * kv_stride + v_off];
+    }
+
+    sh_part[y][x] = partial;
+
+    barrier();
+
+    if (y == 0u) {
+        float sum = sh_part[0][x] + sh_part[1][x] + sh_part[2][x] +
+                    sh_part[3][x] + sh_part[4][x] + sh_part[5][x] +
+                    sh_part[6][x] + sh_part[7][x];
+        out_mat[(m * num_heads + head) * head_dim + d] = sum;
+    }
+}

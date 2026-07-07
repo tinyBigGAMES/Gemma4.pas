@@ -1,0 +1,126 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
+#extension GL_EXT_integer_dot_product : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// Q4_0 weights x Q8_1 activations via hardware integer dot products (DP4A).
+// Same split-plane weight layout, workgroup shape, offsets and dispatch as
+// gemma4_matvec_q4.comp. Per block:
+//   contribution = d4 * d8 * sdot(nib, q8) - 8 * d4 * s8,  s8 = d8*sum(q8)
+// Nibbles are 0..15 (non-negative as signed bytes) so the SIGNED packed dot
+// dotPacked4x8EXT is exact. Planar nibble order: q4 word w low nibbles =
+// values 4w..4w+3 (pair with q8 word w), high nibbles = values 16+4w..16+4w+3
+// (pair with q8 word w+4).
+//
+// Two blocks in flight per lane per iteration (memory pipelining), matching
+// the pass-2 float kernel structure.
+//
+// Dispatch: ceil(nrows / 8) workgroups
+
+layout(local_size_x = 32, local_size_y = 8) in;
+
+layout(push_constant) uniform PushConstants {
+    uint ncols;
+    uint nrows;
+    uint quants_vec4_offset;
+    uint scales_word_offset;
+};
+
+layout(set = 0, binding = 0) readonly restrict buffer QuantsBuf {
+    uvec4 quants[];
+};
+
+layout(set = 0, binding = 1) readonly restrict buffer ScalesBuf {
+    uint scales[];
+};
+
+layout(set = 0, binding = 2) readonly restrict buffer Q8QsBuf {
+    uint q8qs[];   // 8 words per block
+};
+
+layout(set = 0, binding = 3) readonly restrict buffer Q8DsBuf {
+    uint q8ds[];   // packHalf2x16(d8, s8) per block
+};
+
+layout(set = 0, binding = 4) writeonly restrict buffer OutputBuf {
+    float output_vec[];
+};
+
+// Integer dot of one Q4 block word-pair against Q8 words. q4 word w expands
+// to low-nibble bytes (values 4w..4w+3) and high-nibble bytes (values
+// 16+4w..16+4w+3); 0x0F0F0F0F masking keeps bytes in 0..15 (positive signed).
+int block_idot(uvec4 q, uint qbase) {
+    int acc = 0;
+    [[unroll]] for (uint w = 0u; w < 4u; w++) {
+        uint lo = q[w] & 0x0F0F0F0Fu;
+        uint hi = (q[w] >> 4u) & 0x0F0F0F0Fu;
+        acc += dotPacked4x8EXT(int(lo), int(q8qs[qbase + w]));
+        acc += dotPacked4x8EXT(int(hi), int(q8qs[qbase + 4u + w]));
+    }
+    return acc;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x * 8u + gl_LocalInvocationID.y;
+    uint lane = gl_LocalInvocationID.x;
+    uint blocks_per_row = ncols / 32u;
+
+    float sum = 0.0;
+
+    if (row < nrows) {
+        uint row_block0 = row * blocks_per_row;
+        uint b = lane;
+
+        // Paired loop: blocks b and b+32 in flight together
+        for (; b + 32u < blocks_per_row; b += 64u) {
+            uint blk0 = row_block0 + b;
+            uint blk1 = blk0 + 32u;
+
+            uvec4 q0 = quants[quants_vec4_offset + blk0];
+            uvec4 q1 = quants[quants_vec4_offset + blk1];
+            uint sw0 = scales[scales_word_offset + (blk0 >> 1u)];
+            uint sw1 = scales[scales_word_offset + (blk1 >> 1u)];
+            vec2 ds0 = unpackHalf2x16(q8ds[b]);
+            vec2 ds1 = unpackHalf2x16(q8ds[b + 32u]);
+
+            float d40 = ((blk0 & 1u) == 0u)
+                ? unpackHalf2x16(sw0).x
+                : unpackHalf2x16(sw0).y;
+            float d41 = ((blk1 & 1u) == 0u)
+                ? unpackHalf2x16(sw1).x
+                : unpackHalf2x16(sw1).y;
+
+            int idot0 = block_idot(q0, b * 8u);
+            int idot1 = block_idot(q1, (b + 32u) * 8u);
+
+            // Factored: d4*d8*idot - 8*d4*s8 = d4*(d8*idot - 8*s8)
+            sum += d40 * (ds0.x * float(idot0) - 8.0 * ds0.y);
+            sum += d41 * (ds1.x * float(idot1) - 8.0 * ds1.y);
+        }
+
+        // Tail: at most one unpaired block remains for this lane
+        if (b < blocks_per_row) {
+            uint blk = row_block0 + b;
+
+            uvec4 q = quants[quants_vec4_offset + blk];
+            uint sw = scales[scales_word_offset + (blk >> 1u)];
+            vec2 dsb = unpackHalf2x16(q8ds[b]);
+
+            float d4 = ((blk & 1u) == 0u)
+                ? unpackHalf2x16(sw).x
+                : unpackHalf2x16(sw).y;
+
+            int idot = block_idot(q, b * 8u);
+            sum += d4 * (dsb.x * float(idot) - 8.0 * dsb.y);
+        }
+    }
+
+    // Reduce across the 32-lane row cluster. Executed by ALL invocations
+    // (inactive rows contribute 0) -- required for subgroup uniformity.
+    sum = subgroupClusteredAdd(sum, 32u);
+
+    if (row < nrows && lane == 0u) {
+        output_vec[row] = sum;
+    }
+}

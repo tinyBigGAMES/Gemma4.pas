@@ -1,0 +1,31 @@
+#version 450
+
+// Gemma4.pas GLU over the last dim: rows of [2*half] -> rows of [half].
+//   dst[n*half + j] = src[n*2half + j] * sigmoid(src[n*2half + half + j])
+// (audio lconv: linear_start output split into value/gate halves)
+// Dispatch: ceil(count / 256) workgroups, count = num_rows * half.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint count;     // num_rows * half
+    uint half_dim;  // half (1024 for the audio lconv)
+};
+
+layout(set = 0, binding = 0) writeonly buffer DstBuf {
+    float dst[];
+};
+
+layout(set = 0, binding = 1) readonly buffer SrcBuf {
+    float src[];
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= count) return;
+    uint n = i / half_dim;
+    uint j = i - n * half_dim;
+    float a = src[n * 2u * half_dim + j];
+    float b = src[n * 2u * half_dim + half_dim + j];
+    dst[i] = a * (1.0 / (1.0 + exp(-b)));
+}

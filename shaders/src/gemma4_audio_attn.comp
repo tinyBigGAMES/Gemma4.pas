@@ -1,0 +1,113 @@
+#version 450
+
+// Gemma4.pas fused audio conformer attention (Gemma4AudioAttention).
+// One workgroup per (query token i, head h). Chunked local attention:
+// query i in chunk c = i / chunk_size attends the context window
+//   keys j in [c*chunk - past_h, c*chunk - past_h + ctx_size)  (ctx = 24)
+// masked by HF sliding_window_mask_function((ctx_left-1, 0)):
+//   valid iff 0 <= (i - j) < past_h  -- self + (past_h-1) past keys.
+// Futures and the distance-past_h key are INVALID (window coords:
+// valid iff qc < tid <= qc + past_h).
+// Transformer-XL relative position bias (13-entry table):
+//   bias(qc, p) = (p >= qc && p - qc <= 12) ? q' . relk[p - qc] : 0
+// where qc = i % chunk_size and p = position inside the context window.
+// (Derived from HF _rel_shift zero-padding; t=0 lands on a masked slot.)
+//
+// q' = q * qscale_vec (per-layer softplus(per_dim_scale) * head_dim^-.5/ln2,
+// precomputed host-side); keys are scaled by k_scale = ln(1+e)/ln2.
+// Scores: softcap tanh(s/cap)*cap, invalid keys = invalid_val, softmax,
+// weighted V sum. All tokens are valid (the engine never pads frames).
+//
+// Layouts: q/k/v [N, heads*head_dim] row-major; relk [13, heads*head_dim];
+// qsvec [layers, head_dim] (indexed by layer push constant);
+// out [N, heads*head_dim].
+//
+// Dispatch: (N, heads, 1) workgroups, local_size_x = 32.
+
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint num_heads;
+    uint head_dim;
+    uint chunk_size;   // 12
+    uint ctx_size;     // 24
+    uint past_h;       // 12
+    uint layer_idx;    // row into qsvec
+    float k_scale;
+    float softcap;     // 50.0
+    float invalid_val; // -1e9
+};
+
+layout(set = 0, binding = 0) readonly buffer QBuf { float q[]; };
+layout(set = 0, binding = 1) readonly buffer KBuf { float k[]; };
+layout(set = 0, binding = 2) readonly buffer VBuf { float v[]; };
+layout(set = 0, binding = 3) readonly buffer RelKBuf { float relk[]; };
+layout(set = 0, binding = 4) readonly buffer QScaleBuf { float qs[]; };
+layout(set = 0, binding = 5) writeonly buffer OutBuf { float outb[]; };
+
+shared float sh_p[32];      // scores -> probabilities (ctx_size <= 32)
+
+void main() {
+    uint i = gl_WorkGroupID.x;      // query token
+    uint h = gl_WorkGroupID.y;      // head
+    if (i >= seq_len) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint stride = num_heads * head_dim;
+    uint qbase = i * stride + h * head_dim;
+    uint chunk = i / chunk_size;
+    uint qc = i - chunk * chunk_size;
+    int win0 = int(chunk * chunk_size) - int(past_h);
+
+    // Each of the first ctx_size threads scores one context slot
+    if (tid < ctx_size) {
+        int j = win0 + int(tid);
+        float s;
+        // Valid iff in-bounds AND qc < tid <= qc + past_h
+        // (HF mask: 0 <= q_idx - kv_idx < past_h, past_h = ctx_left - 1)
+        if (j < 0 || j >= int(seq_len) || tid <= qc || tid > qc + past_h) {
+            s = invalid_val;
+        } else {
+            uint kbase = uint(j) * stride + h * head_dim;
+            float ac = 0.0;
+            float bd = 0.0;
+            uint t = tid - qc;              // rel table index if tid >= qc
+            bool has_bias = (tid >= qc) && (t <= 12u);
+            // relative_k_proj is per LAYER: relk holds [layers, 13, stride]
+            uint rbase = (layer_idx * 13u + t) * stride + h * head_dim;
+            for (uint d = 0u; d < head_dim; d++) {
+                float qd = q[qbase + d] * qs[layer_idx * head_dim + d];
+                ac += qd * k[kbase + d];
+                if (has_bias) bd += qd * relk[rbase + d];
+            }
+            s = ac * k_scale + bd;
+            s = tanh(s / softcap) * softcap;
+        }
+        sh_p[tid] = s;
+    }
+    barrier();
+
+    // Softmax over the ctx_size slots (every thread computes redundantly)
+    float mx = -3.4e38;
+    for (uint p = 0u; p < ctx_size; p++) mx = max(mx, sh_p[p]);
+    float denom = 0.0;
+    for (uint p = 0u; p < ctx_size; p++) denom += exp(sh_p[p] - mx);
+    barrier();
+    if (tid < ctx_size) {
+        sh_p[tid] = exp(sh_p[tid] - mx) / denom;
+    }
+    barrier();
+
+    // Weighted V sum: threads stride the head dims
+    for (uint d = tid; d < head_dim; d += 32u) {
+        float acc = 0.0;
+        for (uint p = 0u; p < ctx_size; p++) {
+            int j = win0 + int(p);
+            if (j >= 0 && j < int(seq_len)) {
+                acc += sh_p[p] * v[uint(j) * stride + h * head_dim + d];
+            }
+        }
+        outb[i * stride + h * head_dim + d] = acc;
+    }
+}

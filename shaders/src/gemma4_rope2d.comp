@@ -1,0 +1,56 @@
+#version 450
+
+// Gemma 4 vision 2D RoPE - NEOX half-split per spatial dimension, in-place.
+// Data layout [batch x num_heads x head_dim], head_dim = 2 * part_dim.
+// Channels [0, part_dim) rotate by the patch X position, channels
+// [part_dim, head_dim) by the Y position. Within each part: NEOX pairs
+// (j, j + part_dim/2), angle = pos * theta^(-(2j) / part_dim).
+// Matches HF apply_multidimensional_rope with ndim=2.
+//
+// One invocation per (patch, head, pair); pairs per head = head_dim/2
+// (part_dim/2 pairs in each of the two parts).
+// Dispatch: ceil(batch * num_heads * head_dim/2 / 64) workgroups.
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint head_dim;    // 64
+    uint num_heads;   // heads in this buffer
+    uint batch;       // number of patches
+    float theta;      // 100.0
+};
+
+layout(set = 0, binding = 0) buffer DataBuf {
+    float data[];
+};
+
+layout(set = 0, binding = 1) readonly buffer PosBuf {
+    int pos[];        // [batch x 2] as (x, y)
+};
+
+void main() {
+    uint part_dim = head_dim / 2u;        // 32
+    uint pairs_per_part = part_dim / 2u;  // 16
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = batch * num_heads * part_dim;
+    if (idx >= total) return;
+
+    uint m = idx / (num_heads * part_dim);
+    uint rem = idx % (num_heads * part_dim);
+    uint head = rem / part_dim;
+    uint p = rem % part_dim;              // pair slot across both parts
+    uint part = p / pairs_per_part;       // 0 = x rotation, 1 = y rotation
+    uint pair = p % pairs_per_part;       // pair index within the part
+
+    float freq = 1.0 / pow(theta, float(pair * 2u) / float(part_dim));
+    float angle = float(pos[m * 2u + part]) * freq;
+    float c = cos(angle);
+    float s = sin(angle);
+
+    uint base = (m * num_heads + head) * head_dim + part * part_dim;
+    float x0 = data[base + pair];
+    float x1 = data[base + pair + pairs_per_part];
+
+    data[base + pair] = x0 * c - x1 * s;
+    data[base + pair + pairs_per_part] = x1 * c + x0 * s;
+}

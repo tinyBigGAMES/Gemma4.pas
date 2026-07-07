@@ -1,0 +1,66 @@
+#version 450
+
+// Gemma4.pas row-wise RMS normalization, in-place
+// Each row of row_size elements is normalized independently:
+//   rms = sqrt(mean(row^2) + eps)
+//   data[i] = data[i] / rms * (has_weight != 0 ? weight[weight_offset + i%row_size] : 1.0)
+// The SAME weight vector [row_size] applies to every row (per-head norms,
+// PLE per-layer-slice norm). weight_offset is a float-element offset into
+// the bound weight buffer (supports binding the big weight blob).
+//
+// Dispatch: (num_rows, 1, 1) workgroups - one workgroup per row
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint row_size;
+    uint num_rows;
+    float eps;
+    uint has_weight;
+    uint weight_offset;
+};
+
+layout(set = 0, binding = 0) buffer DataBuf {
+    float data[];
+};
+
+layout(set = 0, binding = 1) readonly buffer WeightBuf {
+    float weight[];
+};
+
+shared float shared_data[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= num_rows) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * row_size;
+
+    // Pass 1: sum of squares over the row
+    float sum_sq = 0.0;
+    for (uint i = tid; i < row_size; i += 256u) {
+        float val = data[base + i];
+        sum_sq += val * val;
+    }
+
+    shared_data[tid] = sum_sq;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            shared_data[tid] += shared_data[tid + s];
+        }
+        barrier();
+    }
+
+    float inv_rms = 1.0 / sqrt(shared_data[0] / float(row_size) + eps);
+
+    barrier();
+
+    // Pass 2: normalize (each thread touches only its own indices - safe in-place)
+    for (uint i = tid; i < row_size; i += 256u) {
+        float w = (has_weight != 0u) ? weight[weight_offset + i] : 1.0;
+        data[base + i] = data[base + i] * inv_rms * w;
+    }
+}

@@ -1,0 +1,104 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
+
+// Gemma4.pas batched causal attention scores -- WARP-PARALLEL version.
+// One 32-lane warp computes ONE score: lanes stride the head dimension in
+// vec4 steps, so consecutive lanes read consecutive 16 B of the SAME cache
+// entry (fully coalesced), then reduce via subgroupClusteredAdd. Replaces
+// the one-thread-per-score version whose lanes read different entries at
+// 4 KB stride (12.5% bandwidth efficiency, 512-long serial chains).
+//
+// Query m sits at absolute position p = base_position + m and attends key
+// positions [p_start(m) .. p] where p_start(m) = max(0, p - window_size + 1)
+// for sliding attention (window_size > 0) and 0 for full attention
+// (window_size == 0). Key position q lives at ring slot q % ring_entries.
+//
+// Score rows are padded to row_pitch with -1e30; softmax_rows turns padding
+// into exactly 0.0. Attention scale = 1.0 (Gemma 4), no softcap.
+// scores[((m * num_heads) + head) * row_pitch + t]
+//
+// One WARP per (position, head, padded row slot); 8 warps per workgroup.
+// Dispatch: ceil(batch * num_heads * row_pitch / 8) workgroups
+
+layout(local_size_x = 32, local_size_y = 8) in;
+
+layout(push_constant) uniform PushConstants {
+    uint head_dim;
+    uint num_heads;
+    uint num_kv_heads;
+    uint kv_stride;
+    uint ring_entries;
+    uint base_position;
+    uint batch;
+    uint window_size;
+    uint row_pitch;
+};
+
+layout(set = 0, binding = 0) readonly buffer QBuf {
+    vec4 q4[];
+};
+
+layout(set = 0, binding = 1) readonly buffer KCacheBuf {
+    vec4 k4[];
+};
+
+layout(set = 0, binding = 2) buffer ScoresBuf {
+    float scores[];
+};
+
+void main() {
+    uint warp = gl_WorkGroupID.x * 8u + gl_LocalInvocationID.y;
+    uint lane = gl_LocalInvocationID.x;
+    uint total = batch * num_heads * row_pitch;
+
+    float partial = 0.0;
+    uint out_idx = 0u;
+    bool live = false;
+    bool pad = false;
+
+    if (warp < total) {
+        uint m = warp / (num_heads * row_pitch);
+        uint rem = warp % (num_heads * row_pitch);
+        uint head = rem / row_pitch;
+        uint t = rem % row_pitch;
+
+        uint p = base_position + m;
+        uint p_start = 0u;
+        if (window_size > 0u && (p + 1u) > window_size) {
+            p_start = p + 1u - window_size;
+        }
+        uint count = p - p_start + 1u;
+
+        out_idx = (m * num_heads + head) * row_pitch + t;
+
+        if (t >= count) {
+            pad = true;
+        } else {
+            live = true;
+            uint kv_head = head / (num_heads / num_kv_heads);
+            uint entry = (p_start + t) % ring_entries;
+            // vec4 element bases (head_dim and kv_stride are /4-exact)
+            uint k_base4 = (entry * kv_stride + kv_head * head_dim) / 4u;
+            uint q_base4 = ((m * num_heads + head) * head_dim) / 4u;
+            uint nvec = head_dim / 4u;
+
+            // Lane-strided coalesced dot: lanes read consecutive vec4s
+            for (uint j = lane; j < nvec; j += 32u) {
+                partial += dot(q4[q_base4 + j], k4[k_base4 + j]);
+            }
+        }
+    }
+
+    // Uniform reduction: every lane participates
+    float s = subgroupClusteredAdd(partial, 32u);
+
+    if (lane == 0u) {
+        if (live) {
+            scores[out_idx] = s;
+        } else if (pad) {
+            // Causal / window padding: softmax maps this to exactly 0
+            scores[out_idx] = -1.0e30;
+        }
+    }
+}

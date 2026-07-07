@@ -1,0 +1,131 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// Gemma4.pas Q4_0 matrix-vector multiply -- split-plane layout, multi-row
+// workgroups, two blocks in flight per lane (PLAN-gpu-kernels pass 2).
+//
+// Weight layout (built at upload time by DoUploadWeightsToGPU):
+//   quants plane: 16 bytes/block, 16-byte aligned -> ONE uvec4 load/block
+//   scales plane: fp16/block, packed 2-per-uint32 word
+// Nibble semantics (PLANAR, reordered at upload by DoReorderQ4Block):
+// byte j low nibble = value[j], byte j high nibble = value[j+16],
+// value = (nibble - 8) * scale. Planar order makes each nibble plane pair
+// with a CONTIGUOUS 16-element input run, enabling vec4 input loads.
+//
+// Workgroup = 8 rows x 32 lanes. Each 32-lane cluster owns one output row;
+// lanes stride the row's blocks; subgroupClusteredAdd(sum, 32) reduces.
+// Requires gl_SubgroupSize to be a multiple of 32 (NVIDIA 32, AMD 64: both
+// keep clusters row-aligned because rows are 32 consecutive invocations).
+//
+// Pass 2: each lane processes blocks b and b+32 per iteration (stride 64).
+// All four memory transactions (2x quants uvec4, 2x scale word) are issued
+// before any consumption, doubling outstanding loads per lane.
+//
+// Dispatch: ceil(nrows / 8) workgroups
+
+layout(local_size_x = 32, local_size_y = 8) in;
+
+layout(push_constant) uniform PushConstants {
+    uint ncols;
+    uint nrows;
+    uint quants_vec4_offset;  // uvec4-element offset of the quants plane
+                              // within the bound range (bind residual / 16)
+    uint scales_word_offset;  // uint-element offset of the scales plane
+                              // within the bound range (bind residual / 4)
+};
+
+layout(set = 0, binding = 0) readonly restrict buffer QuantsBuf {
+    uvec4 quants[];
+};
+
+layout(set = 0, binding = 1) readonly restrict buffer ScalesBuf {
+    uint scales[];
+};
+
+layout(set = 0, binding = 2) readonly restrict buffer InputBuf {
+    vec4 input_vec4[];  // ncols is always a multiple of 32 -> exact vec4 view
+};
+
+layout(set = 0, binding = 3) writeonly restrict buffer OutputBuf {
+    float output_vec[];
+};
+
+void main() {
+    uint row = gl_WorkGroupID.x * 8u + gl_LocalInvocationID.y;
+    uint lane = gl_LocalInvocationID.x;
+    uint blocks_per_row = ncols / 32u;
+
+    float sum = 0.0;
+
+    if (row < nrows) {
+        uint row_block0 = row * blocks_per_row;
+        uint b = lane;
+
+        // Paired loop: blocks b and b+32 in flight together
+        for (; b + 32u < blocks_per_row; b += 64u) {
+            uint blk0 = row_block0 + b;
+            uint blk1 = blk0 + 32u;
+
+            uvec4 q0 = quants[quants_vec4_offset + blk0];
+            uvec4 q1 = quants[quants_vec4_offset + blk1];
+            uint sw0 = scales[scales_word_offset + (blk0 >> 1u)];
+            uint sw1 = scales[scales_word_offset + (blk1 >> 1u)];
+
+            float scale0 = ((blk0 & 1u) == 0u)
+                ? unpackHalf2x16(sw0).x
+                : unpackHalf2x16(sw0).y;
+            float scale1 = ((blk1 & 1u) == 0u)
+                ? unpackHalf2x16(sw1).x
+                : unpackHalf2x16(sw1).y;
+
+            uint in_base0 = b * 8u;           // block b: first vec4 index
+            uint in_base1 = in_base0 + 256u;  // block b+32: (b+32)*8
+            float bsum0 = 0.0;
+            float bsum1 = 0.0;
+
+            [[unroll]] for (uint w = 0u; w < 4u; w++) {
+                uint word0 = q0[w];
+                uint word1 = q1[w];
+                uvec4 bytes0 = (uvec4(word0) >> uvec4(0u, 8u, 16u, 24u)) & 0xFFu;
+                uvec4 bytes1 = (uvec4(word1) >> uvec4(0u, 8u, 16u, 24u)) & 0xFFu;
+                bsum0 += dot(vec4(bytes0 & 0xFu) - 8.0, input_vec4[in_base0 + w]);
+                bsum0 += dot(vec4(bytes0 >> 4u) - 8.0, input_vec4[in_base0 + 4u + w]);
+                bsum1 += dot(vec4(bytes1 & 0xFu) - 8.0, input_vec4[in_base1 + w]);
+                bsum1 += dot(vec4(bytes1 >> 4u) - 8.0, input_vec4[in_base1 + 4u + w]);
+            }
+            sum += scale0 * bsum0 + scale1 * bsum1;
+        }
+
+        // Tail: at most one unpaired block remains for this lane
+        if (b < blocks_per_row) {
+            uint blk = row_block0 + b;
+
+            uvec4 q = quants[quants_vec4_offset + blk];
+            uint sw = scales[scales_word_offset + (blk >> 1u)];
+            float scale = ((blk & 1u) == 0u)
+                ? unpackHalf2x16(sw).x
+                : unpackHalf2x16(sw).y;
+
+            uint in_base = b * 8u;
+            float bsum = 0.0;
+
+            [[unroll]] for (uint w = 0u; w < 4u; w++) {
+                uint word = q[w];
+                uvec4 bytes = (uvec4(word) >> uvec4(0u, 8u, 16u, 24u)) & 0xFFu;
+                bsum += dot(vec4(bytes & 0xFu) - 8.0, input_vec4[in_base + w]);
+                bsum += dot(vec4(bytes >> 4u) - 8.0, input_vec4[in_base + 4u + w]);
+            }
+            sum += scale * bsum;
+        }
+    }
+
+    // Reduce across the 32-lane row cluster. Executed by ALL invocations
+    // (inactive rows contribute 0) -- required for subgroup uniformity.
+    sum = subgroupClusteredAdd(sum, 32u);
+
+    if (row < nrows && lane == 0u) {
+        output_vec[row] = sum;
+    }
+}

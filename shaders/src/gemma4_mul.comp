@@ -1,0 +1,29 @@
+#version 450
+
+// Gemma4.pas element-wise multiply (in-place on dst)
+// Computes: dst[i] *= src[src_offset + i]
+// src_offset supports multiplying against a slice of a larger buffer
+// (e.g. the per-layer PLE input slice at layer*256).
+//
+// Dispatch: ceil(count / 256) workgroups
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint count;
+    uint src_offset;
+};
+
+layout(set = 0, binding = 0) buffer DstBuf {
+    float dst[];
+};
+
+layout(set = 0, binding = 1) readonly buffer SrcBuf {
+    float src[];
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= count) return;
+    dst[i] *= src[src_offset + i];
+}

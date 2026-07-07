@@ -1,0 +1,86 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// F32 weights x F32 activations, MATRIX-matrix (batched positions).
+// Same tiling as gemma4_matmat_q4q8: 8 output rows (y lanes) x M_TILE=8
+// positions per workgroup, 32 x-lanes striding the columns in vec4 steps.
+// Per 32-vec4 chunk, all 256 threads cooperatively stage the
+// [8 positions x 32 vec4] activation tile into shared memory, then each
+// row-lane loads its weight vec4 ONCE and dots it against 8 positions.
+// Weight vec4 offset comes from the 256-aligned bind residual.
+//
+// Output is position-major: output[m * nrows + row].
+// Dispatch: (ceil(nrows / 8), ceil(batch / 8), 1) workgroups
+
+layout(local_size_x = 32, local_size_y = 8) in;
+
+layout(push_constant) uniform PushConstants {
+    uint ncols;
+    uint nrows;
+    uint weight_vec4_offset;
+    uint batch;
+};
+
+layout(set = 0, binding = 0) readonly restrict buffer WeightBuf {
+    vec4 w4[];
+};
+
+layout(set = 0, binding = 1) readonly restrict buffer InputBuf {
+    vec4 in4[];
+};
+
+layout(set = 0, binding = 2) writeonly restrict buffer OutputBuf {
+    float output_mat[];
+};
+
+// Staged activation tile: 8 positions x 32 vec4 columns = 4 KB
+shared vec4 sh_act[8][32];
+
+void main() {
+    uint row = gl_WorkGroupID.x * 8u + gl_LocalInvocationID.y;
+    uint lane = gl_LocalInvocationID.x;
+    uint yi = gl_LocalInvocationID.y;
+    uint mbase = gl_WorkGroupID.y * 8u;
+    uint nvec = ncols / 4u;
+    uint nchunks = (nvec + 31u) / 32u;
+
+    float acc[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+
+    for (uint c = 0u; c < nchunks; c++) {
+        uint j = c * 32u + lane;
+
+        // Stage: thread (lane, yi) loads activation cell (m = mbase+yi, j)
+        {
+            uint sm = mbase + yi;
+            if (sm < batch && j < nvec) {
+                sh_act[yi][lane] = in4[sm * nvec + j];
+            }
+        }
+
+        barrier();
+
+        // Compute: row-lane dots its weight vec4 against 8 positions
+        if (row < nrows && j < nvec) {
+            vec4 w = w4[weight_vec4_offset + row * nvec + j];
+
+            [[unroll]] for (uint mt = 0u; mt < 8u; mt++) {
+                if (mbase + mt < batch) {
+                    acc[mt] += dot(w, sh_act[mt][lane]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Reduce each position's partial across the 32-lane row cluster
+    [[unroll]] for (uint mt = 0u; mt < 8u; mt++) {
+        float s = subgroupClusteredAdd(acc[mt], 32u);
+        uint m = mbase + mt;
+        if (row < nrows && lane == 0u && m < batch) {
+            output_mat[m * nrows + row] = s;
+        }
+    }
+}
