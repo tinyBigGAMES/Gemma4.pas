@@ -1,7 +1,3 @@
-
-
-https://github.com/user-attachments/assets/d259c73b-685f-4517-a3ad-7ab6669cba43
-
 <div align="center">
 
 ![Gemma4.pas](media/logo.jpg)
