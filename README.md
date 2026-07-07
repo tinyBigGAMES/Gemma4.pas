@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/d259c73b-685f-4517-a3ad-7ab6669cba43
+
 <div align="center">
 
 ![Gemma4.pas](media/logo.jpg)
@@ -46,11 +50,9 @@ Gemma4.pas runs the full Gemma 4 E4B model: text generation with a thinking/reas
 
 ![Gemma4.pas Infographic](media/infographic.jpg)
 
-https://github.com/user-attachments/assets/VIDEO_ID_HERE
+https://github.com/user-attachments/assets/22e43766-2bc3-478e-b928-633f4ad202b2
 
 </div>
-
-> Upload `media\explainer.mp4` via GitHub's web UI (drag into a comment), copy the generated `user-attachments` URL, and replace the placeholder above.
 
 ## 🎯 Who is Gemma4.pas For?
 
