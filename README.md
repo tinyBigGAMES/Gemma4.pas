@@ -43,6 +43,7 @@ Gemma4.pas runs the full Gemma 4 E4B model: text generation with a thinking/reas
 ## 🎬 Media
 
 <div align="center">
+Infographic <br/>  
 
 ![Gemma4.pas Infographic](media/infographic.jpg)
 
