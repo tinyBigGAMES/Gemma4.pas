@@ -60,7 +60,9 @@ const
 
   // Maximum sequence length for the GPU-resident KV cache. Full-attention
   // cache slots are sized entries * 2 * 512 floats (32 MB each at 8192).
-  // Sliding slots are 512-entry rings regardless of this value.
+  // Sliding slots are ALSO sized to this value (PLAN-kv-prefix): rings no
+  // longer wrap within capacity, which keeps every past position intact
+  // and makes TruncateTo rollback safe for KV prefix reuse.
   CGpuMaxSeq = 8192;
 
 type
@@ -301,6 +303,18 @@ type
     ): TArray<Integer>;
 
     procedure Reset();
+    procedure TruncateTo(const APosition: Integer);
+
+    // Release all GPU-resident buffers (weights, working set, KV rings, batch
+    // buffers) while the compute device is still alive. Must be called before
+    // the owning device/kernels are shut down, otherwise the buffers leak:
+    // DoFreeGpuBuffers early-exits once FComputeKernels.Device is nil. Safe to
+    // call more than once (DoFreeGpuBuffers guards every buffer handle).
+    procedure FreeGpuResources();
+
+    // KV state persistence -- save/load the GPU KV cache to/from a file
+    function SaveKVState(const AFileName: string): Boolean;
+    function LoadKVState(const AFileName: string): Boolean;
 
     // Snapshot the profiling accumulators from the last Generate call
     // into per-token averages (see TInferenceStats in Gemma4.Types)
@@ -313,6 +327,19 @@ type
   end;
 
 implementation
+
+uses
+  System.Classes;
+
+const
+  { CKV_MAGIC }
+  // File magic for KV state files ('G4KV')
+  CKV_MAGIC   = $564B3447;
+
+  { CKV_VERSION }
+  // Version 2: sliding KV rings grown to CGpuMaxSeq (PLAN-kv-prefix);
+  // version-1 files carry the old ring geometry and must be rejected
+  CKV_VERSION = 2;
 
 { TSamplingParams }
 
@@ -781,8 +808,8 @@ begin
   // GPU KV cache: one K + one V buffer per unique slot. Slot i is owned by
   // layer i (layers 0..23 have their own caches; 24..41 share via KvCacheMap).
   // Geometry follows the owner layer's attention type:
-  //   sliding: 512-entry ring x (2 * 256) floats  = 1 MB
-  //   full:    CGpuMaxSeq entries x (2 * 512) floats
+  //   sliding: CGpuMaxSeq entries x (2 * 256) floats (16 MB each at 8192)
+  //   full:    CGpuMaxSeq entries x (2 * 512) floats (32 MB each at 8192)
   SetLength(FGpuKvK, FConfig.NumUniqueKvCaches);
   SetLength(FGpuKvV, FConfig.NumUniqueKvCaches);
   for LI := 0 to FConfig.NumUniqueKvCaches - 1 do
@@ -794,9 +821,11 @@ begin
     end
     else
     begin
-      // Window + one full prefill chunk: batched appends never overwrite
-      // keys still inside any in-chunk query's window (see PLAN-batched-prefill)
-      LEntries := FConfig.SlidingWindow + CPrefillBatch;
+      // Full-capacity rings (PLAN-kv-prefix): sized to CGpuMaxSeq so no
+      // position is ever clobbered, enabling TruncateTo rollback for KV
+      // prefix reuse. Also covers the batched-prefill overwrite hazard
+      // that the old SlidingWindow + CPrefillBatch sizing addressed.
+      LEntries := CGpuMaxSeq;
       LStride := FConfig.NumKeyValueHeads * FConfig.HeadDim;
     end;
 
@@ -1051,7 +1080,7 @@ begin
     LHeadDim := FConfig.HeadDim;
     LRopeTheta := FConfig.RopeSliding.Theta;
     LRopePartial := 1.0;
-    LRingEntries := FConfig.SlidingWindow + CPrefillBatch;
+    LRingEntries := CGpuMaxSeq;
   end;
 
   // Rotating angle pairs -- must match CpuApplyRoPE exactly
@@ -1542,7 +1571,7 @@ begin
     LHeadDim := FConfig.HeadDim;
     LRopeTheta := FConfig.RopeSliding.Theta;
     LRopePartial := 1.0;
-    LRingEntries := FConfig.SlidingWindow + CPrefillBatch;
+    LRingEntries := CGpuMaxSeq;
     LWindowSize := FConfig.SlidingWindow;
     LRowPitch := Min(FPosition + ABatch, FConfig.SlidingWindow);
   end;
@@ -2908,10 +2937,254 @@ begin
   end;
 end;
 
+procedure TModel.FreeGpuResources();
+begin
+  DoFreeGpuBuffers();
+end;
+
 procedure TModel.Reset();
 begin
   FKvCache.Clear();
   FPosition := 0;
+end;
+
+procedure TModel.TruncateTo(const APosition: Integer);
+begin
+  // Rewind the KV position for prefix reuse: rows beyond APosition are
+  // logically dead and will be overwritten by the next prefill. Rings
+  // are sized CGpuMaxSeq (PLAN-kv-prefix), so any rollback target is
+  // intact. GPU path only -- callers gate on UseGPU (the CPU FKvCache
+  // is untested for rewind).
+  if (APosition < 0) or (APosition > FPosition) then
+  begin
+    GetErrors().Add(esError, CMD_ERR_FORWARD,
+      'TruncateTo(%d) out of range 0..%d', [APosition, FPosition]);
+    Exit;
+  end;
+  FPosition := APosition;
+end;
+
+function TModel.SaveKVState(const AFileName: string): Boolean;
+var
+  LStream: TFileStream;
+  LI: Integer;
+  LEntries: Integer;
+  LStride: Integer;
+  LBufSize: UInt64;
+  LBuf: Pointer;
+  LMaxBufSize: UInt64;
+  LMagic: UInt32;
+  LVersion: UInt32;
+begin
+  Result := False;
+
+  if not FUseGPU then
+  begin
+    GetErrors().Add(esError, CMD_ERR_FORWARD,
+      'KV state save requires GPU mode');
+    Exit;
+  end;
+
+  if FPosition = 0 then
+  begin
+    GetErrors().Add(esError, CMD_ERR_FORWARD,
+      'KV cache is empty -- nothing to save');
+    Exit;
+  end;
+
+  // Find the largest buffer size for a single allocation
+  LMaxBufSize := 0;
+  for LI := 0 to FConfig.NumUniqueKvCaches - 1 do
+  begin
+    if FConfig.LayerTypes[LI] = akFull then
+    begin
+      LEntries := CGpuMaxSeq;
+      LStride := FConfig.NumKeyValueHeads * FConfig.GlobalHeadDim;
+    end
+    else
+    begin
+      LEntries := CGpuMaxSeq;
+      LStride := FConfig.NumKeyValueHeads * FConfig.HeadDim;
+    end;
+    LBufSize := UInt64(LEntries) * UInt64(LStride) * SizeOf(Single);
+    if LBufSize > LMaxBufSize then
+      LMaxBufSize := LBufSize;
+  end;
+
+  GetMem(LBuf, LMaxBufSize);
+  try
+    try
+      LStream := TFileStream.Create(AFileName, fmCreate);
+      try
+        // Header: magic, version, num_slots, position
+        LMagic := CKV_MAGIC;
+        LVersion := CKV_VERSION;
+        LStream.WriteBuffer(LMagic, SizeOf(UInt32));
+        LStream.WriteBuffer(LVersion, SizeOf(UInt32));
+        LI := FConfig.NumUniqueKvCaches;
+        LStream.WriteBuffer(LI, SizeOf(Integer));
+        LStream.WriteBuffer(FPosition, SizeOf(Integer));
+
+        // Per-slot K and V blobs
+        for LI := 0 to FConfig.NumUniqueKvCaches - 1 do
+        begin
+          if FConfig.LayerTypes[LI] = akFull then
+          begin
+            LEntries := CGpuMaxSeq;
+            LStride := FConfig.NumKeyValueHeads * FConfig.GlobalHeadDim;
+          end
+          else
+          begin
+            LEntries := CGpuMaxSeq;
+            LStride := FConfig.NumKeyValueHeads * FConfig.HeadDim;
+          end;
+          LBufSize := UInt64(LEntries) * UInt64(LStride) * SizeOf(Single);
+
+          // Download K
+          FComputeKernels.Device.DownloadFromDeviceBuffer(
+            FGpuKvK[LI], LBuf, LBufSize);
+          LStream.WriteBuffer(LBuf^, LBufSize);
+
+          // Download V
+          FComputeKernels.Device.DownloadFromDeviceBuffer(
+            FGpuKvV[LI], LBuf, LBufSize);
+          LStream.WriteBuffer(LBuf^, LBufSize);
+        end;
+      finally
+        LStream.Free();
+      end;
+
+      Result := True;
+    except
+      on E: Exception do
+      begin
+        GetErrors().Add(esError, CMD_ERR_FORWARD,
+          'Failed to save KV state: ' + E.Message);
+        Result := False;
+      end;
+    end;
+  finally
+    FreeMem(LBuf);
+  end;
+end;
+
+function TModel.LoadKVState(const AFileName: string): Boolean;
+var
+  LStream: TFileStream;
+  LI: Integer;
+  LMagic: UInt32;
+  LVersion: UInt32;
+  LNumSlots: Integer;
+  LPosition: Integer;
+  LEntries: Integer;
+  LStride: Integer;
+  LBufSize: UInt64;
+  LBuf: Pointer;
+  LMaxBufSize: UInt64;
+begin
+  Result := False;
+
+  if not FUseGPU then
+  begin
+    GetErrors().Add(esError, CMD_ERR_FORWARD,
+      'KV state load requires GPU mode');
+    Exit;
+  end;
+
+  // Find the largest buffer size
+  LMaxBufSize := 0;
+  for LI := 0 to FConfig.NumUniqueKvCaches - 1 do
+  begin
+    if FConfig.LayerTypes[LI] = akFull then
+    begin
+      LEntries := CGpuMaxSeq;
+      LStride := FConfig.NumKeyValueHeads * FConfig.GlobalHeadDim;
+    end
+    else
+    begin
+      LEntries := CGpuMaxSeq;
+      LStride := FConfig.NumKeyValueHeads * FConfig.HeadDim;
+    end;
+    LBufSize := UInt64(LEntries) * UInt64(LStride) * SizeOf(Single);
+    if LBufSize > LMaxBufSize then
+      LMaxBufSize := LBufSize;
+  end;
+
+  GetMem(LBuf, LMaxBufSize);
+  try
+    try
+      LStream := TFileStream.Create(AFileName, fmOpenRead or fmShareDenyWrite);
+      try
+        // Read and validate header
+        LStream.ReadBuffer(LMagic, SizeOf(UInt32));
+        if LMagic <> CKV_MAGIC then
+        begin
+          GetErrors().Add(esError, CMD_ERR_FORWARD,
+            'Invalid KV state file (bad magic)');
+          Exit;
+        end;
+
+        LStream.ReadBuffer(LVersion, SizeOf(UInt32));
+        if LVersion <> CKV_VERSION then
+        begin
+          GetErrors().Add(esError, CMD_ERR_FORWARD,
+            'Unsupported KV state version');
+          Exit;
+        end;
+
+        LStream.ReadBuffer(LNumSlots, SizeOf(Integer));
+        if LNumSlots <> FConfig.NumUniqueKvCaches then
+        begin
+          GetErrors().Add(esError, CMD_ERR_FORWARD,
+            Format('KV slot count mismatch (file %d, model %d)',
+              [LNumSlots, FConfig.NumUniqueKvCaches]));
+          Exit;
+        end;
+
+        LStream.ReadBuffer(LPosition, SizeOf(Integer));
+
+        // Upload per-slot K and V blobs
+        for LI := 0 to FConfig.NumUniqueKvCaches - 1 do
+        begin
+          if FConfig.LayerTypes[LI] = akFull then
+          begin
+            LEntries := CGpuMaxSeq;
+            LStride := FConfig.NumKeyValueHeads * FConfig.GlobalHeadDim;
+          end
+          else
+          begin
+            LEntries := CGpuMaxSeq;
+            LStride := FConfig.NumKeyValueHeads * FConfig.HeadDim;
+          end;
+          LBufSize := UInt64(LEntries) * UInt64(LStride) * SizeOf(Single);
+
+          // Upload K
+          LStream.ReadBuffer(LBuf^, LBufSize);
+          FComputeKernels.Device.UploadToDeviceBuffer(
+            FGpuKvK[LI], LBuf, LBufSize);
+
+          // Upload V
+          LStream.ReadBuffer(LBuf^, LBufSize);
+          FComputeKernels.Device.UploadToDeviceBuffer(
+            FGpuKvV[LI], LBuf, LBufSize);
+        end;
+
+        FPosition := LPosition;
+        Result := True;
+      finally
+        LStream.Free();
+      end;
+    except
+      on E: Exception do
+      begin
+        GetErrors().Add(esError, CMD_ERR_FORWARD,
+          'Failed to load KV state: ' + E.Message);
+        Result := False;
+      end;
+    end;
+  finally
+    FreeMem(LBuf);
+  end;
 end;
 
 procedure TModel.GetStats(out AStats: TInferenceStats);
@@ -2925,6 +3198,7 @@ begin
   if FProfElapsedSec > 0.0 then
     AStats.TokensPerSec := FProfTokens / FProfElapsedSec;
 
+  AStats.Position := FPosition;
   AStats.PrefillTokenCount := FProfPrefillTokens;
   AStats.PrefillSec := FProfPrefillSec;
   if FProfPrefillSec > 0.0 then

@@ -26,7 +26,10 @@ uses
   UDemo.Pack,
   UDemo.Inference,
   UDemo.Embedding,
-  UDemo.Multimedia;
+  UDemo.Multimedia,
+  UDemo.Chat,
+  UDemo.ChatWithTools,
+  UDemo.ChatWithDynTools;
 
 procedure Menu();
 var
@@ -41,10 +44,20 @@ begin
     LMenu.AddTestDemo(TDemoInference);
     LMenu.AddTestDemo(TDemoEmbedding);
     LMenu.AddTestDemo(TDemoMultimedia);
+    LMenu.AddTestDemo(TDemoChat);
+    LMenu.AddTestDemo(TDemoChatWithTools);
+    LMenu.AddTestDemo(TDemoChatWithDynTools);
     LMenu.Run();
   finally
     LMenu.Free();
   end;
+end;
+
+procedure RunTest(const AProc: TProc);
+begin
+  AProc();
+  if TUtils.RunFromIDE() then
+    TConsole.Pause();
 end;
 
 procedure RunTestbed();

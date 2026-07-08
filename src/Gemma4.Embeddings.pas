@@ -133,6 +133,9 @@ type
     procedure Close();
     function IsLoaded(): Boolean;
 
+    // Embedding vector dimensionality (768 for EmbeddingGemma-300m)
+    function EmbeddingDim(): Integer;
+
     // Raw text -> 768-dim L2-normalized embedding (empty array on failure)
     function Embed(const AText: string): TArray<Single>;
     // Retrieval helpers with the model's exact prompt prefixes
@@ -494,6 +497,11 @@ end;
 function TEmbeddings.IsLoaded(): Boolean;
 begin
   Result := FIsLoaded;
+end;
+
+function TEmbeddings.EmbeddingDim(): Integer;
+begin
+  Result := FConfig.HiddenSize;
 end;
 
 procedure TEmbeddings.DoRecordNormRows(const ATensorName: string;

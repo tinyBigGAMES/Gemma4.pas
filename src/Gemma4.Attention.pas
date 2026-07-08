@@ -1,7 +1,7 @@
 ﻿{===============================================================================
-  Gemma4.pas� - Local LLM inference in Pascal
+  Gemma4.pas™ - Local LLM inference in Pascal
 
-  Copyright � 2026-present tinyBigGAMES� LLC
+  Copyright © 2026-present tinyBigGAMES™ LLC
   All Rights Reserved.
 
   See LICENSE for license information

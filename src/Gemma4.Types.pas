@@ -1,7 +1,7 @@
-{===============================================================================
-  Gemma4.pas™ - Local LLM inference in Pascal
+ï»¿{===============================================================================
+  Gemma4.pasâ„¢ - Local LLM inference in Pascal
 
-  Copyright © 2026-present tinyBigGAMES™ LLC
+  Copyright Â© 2026-present tinyBigGAMESâ„¢ LLC
   All Rights Reserved.
 
   See LICENSE for license information
@@ -229,6 +229,7 @@ type
     PrefillTokenCount: Integer;   // prompt tokens processed before generation
     PrefillSec: Double;           // wall-clock prompt processing time
     PrefillTokensPerSec: Double;  // prompt processing speed
+    Position: Integer;            // absolute KV position after the last Generate (prompt + generated)
     HasGpuStats: Boolean;   // False on the CPU path or if timestamps failed
     Phases: TInferencePhaseStats;
     Gpu: TInferenceGpuStats;

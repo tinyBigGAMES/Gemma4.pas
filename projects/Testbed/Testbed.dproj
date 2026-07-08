@@ -118,13 +118,16 @@
         </DelphiCompile>
         <DCCReference Include="..\..\src\Gemma4.Attention.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Audio.pas"/>
+        <DCCReference Include="..\..\src\Gemma4.Common.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Compute.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Config.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Embeddings.pas"/>
+        <DCCReference Include="..\..\src\Gemma4.HNSW.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Image.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Inference.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Jinja.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Layers.pas"/>
+        <DCCReference Include="..\..\src\Gemma4.Memory.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Model.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Packer.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Quant.pas"/>
@@ -132,17 +135,24 @@
         <DCCReference Include="..\..\src\Gemma4.Shaders.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Tensors.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Tokenizer.pas"/>
+        <DCCReference Include="..\..\src\Gemma4.Tools.pas"/>
+        <DCCReference Include="..\..\src\Gemma4.Tools.Utils.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Types.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Video.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Vision.pas"/>
         <DCCReference Include="..\..\src\Gemma4.Vulkan.pas"/>
         <DCCReference Include="..\..\src\StdApp.Resources.pas"/>
+        <DCCReference Include="..\..\src\Gemma4.Session.pas"/>
+        <DCCReference Include="..\..\src\Gemma4.Chat.pas"/>
+        <DCCReference Include="UDemo.Chat.pas"/>
+        <DCCReference Include="UDemo.ChatWithDynTools.pas"/>
+        <DCCReference Include="UDemo.ChatWithTools.pas"/>
         <DCCReference Include="UDemo.Embedding.pas"/>
         <DCCReference Include="UDemo.Inference.pas"/>
         <DCCReference Include="UDemo.Multimedia.pas"/>
         <DCCReference Include="UDemo.Pack.pas"/>
-        <DCCReference Include="UTestbed.pas"/>
         <DCCReference Include="UTestbed.Common.pas"/>
+        <DCCReference Include="UTestbed.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>
@@ -190,9 +200,9 @@
                         <Overwrite>true</Overwrite>
                     </Platform>
                 </DeployFile>
-                <DeployFile LocalName="..\..\bin\Testbed.rsm" Configuration="Debug" Class="DebugSymbols">
+                <DeployFile LocalName="..\..\bin\Testbed.exe" Configuration="Release" Class="ProjectOutput">
                     <Platform Name="Win64">
-                        <RemoteName>Testbed.rsm</RemoteName>
+                        <RemoteName>Testbed.exe</RemoteName>
                         <Overwrite>true</Overwrite>
                     </Platform>
                 </DeployFile>

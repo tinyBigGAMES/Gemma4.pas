@@ -16,7 +16,8 @@ uses
   StdApp.Console.Adapter,
   StdApp.TestDemo,
   Gemma4.Types,
-  Gemma4.Inference;
+  Gemma4.Inference,
+  Gemma4.Chat;
 
 const
   CSafetensorsFile = 'C:\Dev\LLM\SAFETENSORS\Huihui-gemma-4-E4B-it-qat-q4_0-unquantized-abliterated\model.safetensors';
@@ -24,6 +25,11 @@ const
   CEmbSafetensorsDir = 'C:\Dev\LLM\SAFETENSORS\embeddinggemma-300m';
   CEmbBuildDir = 'C:\Dev\LLM\VPK\Gemma4\embeddings';
   CVpkOutputFile = 'C:\Dev\LLM\VPK\Gemma4.vpk';
+
+  { Chat demo constants }
+  CMaxTokens  = 2048;
+  CChatMemory = 'chat_memory.db';
+  CChatSystemPrompt = 'You are Gemma4, a helpful assistant powered by Gemma4.pas!';
 
 type
   { TBaseDemoCase }
@@ -59,6 +65,24 @@ type
     class function CheckForVPKFiles(): Boolean;
 
     property Adapter: TConsoleAdapter read FAdapter;
+  end;
+
+  { TBaseDemoChat }
+  // Common base for chat demos. Creates a TConsoleChat, applies shared
+  // config (VPK path, system prompt, thinking, max tokens), calls the
+  // DoConfigureChat hook for subclass-specific setup (tools, etc.),
+  // then runs the interactive loop.
+  TBaseDemoChat = class(TTestDemo)
+  private
+    FChat: TConsoleChat;
+  protected
+    // Override to configure tools or other chat-specific settings.
+    // FChat is created and common config applied before this fires.
+    procedure DoConfigureChat(); virtual;
+  public
+    constructor Create(); override;
+    procedure OnRender(); override;
+    property Chat: TConsoleChat read FChat;
   end;
 
 // Standalone callbacks -- cast AUserData to TBaseDemoCase and delegate.
@@ -190,6 +214,41 @@ class function TBaseDemoCase.CheckForVPKFiles(): Boolean;
 begin
   Result := FileExists(CSafetensorsFile) and
             TDirectory.Exists(CEmbSafetensorsDir);
+end;
+
+{ TBaseDemoChat }
+
+constructor TBaseDemoChat.Create();
+begin
+  inherited;
+  FChat := nil;
+end;
+
+procedure TBaseDemoChat.DoConfigureChat();
+begin
+  // no-op -- override to add tools, etc.
+end;
+
+procedure TBaseDemoChat.OnRender();
+begin
+  FChat := TConsoleChat.Create();
+  try
+    FChat.ModelPath := CVpkOutputFile;
+    FChat.MemoryDbPath := CChatMemory;
+    FChat.MaxTokens := CMaxTokens;
+    FChat.EnableThinking := True;
+    FChat.ShowThinking := True;
+    FChat.SystemPrompt := CChatSystemPrompt;
+
+    DoConfigureChat();
+
+    FChat.Run();
+  finally
+    FChat.Free();
+    FChat := nil;
+  end;
+
+  Terminate();
 end;
 
 end.

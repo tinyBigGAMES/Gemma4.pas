@@ -92,3 +92,7 @@ distro.yml
 /distro
 !shaders/glslangValidator.exe
 /shaders/spv
+/bin/res/database
+!bin/res/python/**
+/bin/res/scripts/*
+!/bin/res/scripts/.gitkeep

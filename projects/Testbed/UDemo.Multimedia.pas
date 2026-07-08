@@ -49,7 +49,7 @@ var
   LVideoPath: string;
   LStats: TInferenceStats;
 begin
-  LResDir := ExtractFilePath(ParamStr(0)) + 'res' + PathDelim;
+  LResDir := ExtractFilePath(ParamStr(0)) + 'res\assets' + PathDelim;
   LImagePath := LResDir + 'image.png';
   LAudioPath := LResDir + 'audio.wav';
   LVideoPath := LResDir + 'video.mp4';

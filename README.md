@@ -43,9 +43,10 @@ Gemma4.pas runs the full Gemma 4 E4B model: text generation with a thinking/reas
 ## 🎬 Media
 
 <div align="center">
-Infographic <br/>  
+<br/>  
 
 ![Gemma4.pas Infographic](media/infographic.jpg)
+  
 
 https://github.com/user-attachments/assets/22e43766-2bc3-478e-b928-633f4ad202b2
 
@@ -69,6 +70,17 @@ https://github.com/user-attachments/assets/22e43766-2bc3-478e-b928-633f4ad202b2
 - **4-bit quantization**: Q4_0 decoder weights with DP4A integer dot products; vision/audio/embedding encoders stay at full F32 precision.
 - **Vulkan compute**: all matrix math, attention, softmax, and normalization run on the GPU as compiled SPIR-V shaders.
 - **Zero dependencies**: pure Delphi -- no DLLs, no Python, no C runtime.
+
+### Application layer (optional)
+
+Built on top of the engine, and easy to ignore if you only need generation:
+
+- **Tool calling**: a fluent `TToolRegistry` plus a ready-made catalog (weather, web search, files, Python) so the model can call functions and act on the results.
+- **Persistent memory**: `TMemory` -- a SQLite conversation archive with FTS5 keyword search fused with HNSW vector recall (backed by the bundled embeddings model).
+- **Infinite memory**: old turns are summarized before eviction, so a conversation can run indefinitely without the context simply falling off a cliff.
+- **Conversation policy**: `TSession` drives the generate -> execute -> regenerate agentic loop, recall injection, and history budgeting in a single `Ask` call.
+- **Interactive chat**: `TChat` / `TConsoleChat` -- an abstract chat loop with a console frontend and a full set of slash commands.
+- **KV state save/load**: persist and restore the GPU KV cache (`.g4kv`) to resume a conversation with a warm prefix.
 
 ## 🚀 Getting Started
 
@@ -151,6 +163,45 @@ finally
 end;
 ```
 
+## 🧰 Application Layer
+
+Turn the raw engine into an agent or an assistant. Register tools, hand them to a `TSession`, and one `Ask` call runs the full generate -> execute -> regenerate loop:
+
+```pascal
+uses
+  Gemma4.Inference, Gemma4.Tools, Gemma4.Tools.Utils, Gemma4.Session;
+
+LInf := TInference.Create();
+LTools := TToolRegistry.Create();
+LSession := TSession.Create();
+try
+  LInf.LoadModel('C:\Dev\LLM\VPK\Gemma4.vpk');
+  RegisterStandardTools(LTools);          // weather, web_search, files, ...
+
+  LSession.SetInference(LInf);
+  LSession.SetToolRegistry(LTools);
+  WriteLn(LSession.Ask('What is the weather in Tokyo?', 1024));
+finally
+  LSession.Free(); LTools.Free(); LInf.Free();
+end;
+```
+
+Attach a `TMemory` for persistent recall (SQLite + FTS5 + HNSW), or skip straight to `TConsoleChat` for a full interactive assistant with slash commands (`/addfact`, `/addfile`, `/summary`, `/state`, `/restore`, ...):
+
+```pascal
+LChat := TConsoleChat.Create();
+try
+  LChat.ModelPath := 'C:\Dev\LLM\VPK\Gemma4.vpk';
+  LChat.MemoryDbPath := 'res\database\chat.db';
+  LChat.Run();          // blocks until the user types /quit
+finally
+  LChat.Free();
+end;
+```
+
+> [!NOTE]
+> The `web_search` tool uses the [Tavily](https://tavily.com) API. It is optional -- everything else works with no key. To enable it, create a free Tavily key (1000 credits/month; see [pricing](https://tavily.com/#pricing)) and set the `TAVILY_API_KEY` environment variable.
+
 ## ⚡ Performance
 
 Measured on an NVIDIA RTX 3060 (12 GB VRAM):
@@ -168,7 +219,46 @@ The full API reference, architecture guide, and how-to recipes are in a single d
 
 | Document | Description |
 |----------|-------------|
-| **[Gemma4.pas Documentation](docs/Gemma4-pas.md)** | Complete tour: `TInference` API (loading, messages, generation, thinking, multimodal, stats), `TEmbeddings` API, architecture (42-layer decoder, Vulkan pipeline, Q4_0 quantization, VPK format, vision/audio/video encoders, embeddings model), and practical how-to recipes with verified testbed code. |
+| **[Gemma4.pas Documentation](docs/Gemma4-pas.md)** | Complete tour: `TInference` API (loading, messages, generation, thinking, multimodal, stats), `TEmbeddings` API, the application layer (tools, `TMemory`, `THNSW`, `TSession`, `TChat`, KV state), architecture (42-layer decoder, Vulkan pipeline, Q4_0 quantization, VPK format, vision/audio/video encoders, embeddings model), and practical how-to recipes with verified testbed code. |
+
+## 🗂️ Module Map
+
+**Inference engine**
+
+| Unit | Role |
+|------|------|
+| `Gemma4.Types` | Shared types, records, constants, enums |
+| `Gemma4.Config` | Model config loader (config.json) |
+| `Gemma4.Tokenizer` | BPE tokenizer (262144-token vocabulary) |
+| `Gemma4.Tensors` | Tensor storage, views, basic ops |
+| `Gemma4.Quant` | Q4_0 quantization and dequantization |
+| `Gemma4.Safetensors` | Safetensors header/tensor parser |
+| `Gemma4.Packer` | Offline packing tool: safetensors -> VPK |
+| `Gemma4.Attention` | RoPE, GQA, sliding + full attention, KV cache |
+| `Gemma4.Layers` | RMSNorm, GeLU MLP, residual connections |
+| `Gemma4.Model` | Forward pass orchestration, generation loop |
+| `Gemma4.Vulkan` | Vulkan device, queues, buffer management |
+| `Gemma4.Shaders` | SPIR-V loading and pipeline cache |
+| `Gemma4.Compute` | GPU kernel dispatch (GEMM, softmax, RoPE) |
+| `Gemma4.Jinja` | Full Jinja chat template engine |
+| `Gemma4.Image` | Image decode, resize, patchify (VCL Graphics) |
+| `Gemma4.Vision` | SigLIP vision encoder (16 layers, F32 GPU) |
+| `Gemma4.Audio` | Conformer audio encoder (12 layers, F32 GPU) |
+| `Gemma4.Video` | Video frame extraction (Windows Media Foundation) |
+| `Gemma4.Embeddings` | EmbeddingGemma-300m bidirectional encoder |
+| `Gemma4.Inference` | Top-level API: messages, template, generate, stream |
+
+**Application layer** (optional, builds on `Gemma4.Inference`)
+
+| Unit | Role |
+|------|------|
+| `Gemma4.Common` | Shared resource-path resolution and constants |
+| `Gemma4.Tools` | Tool registry, fluent builder, schema generation, dispatch |
+| `Gemma4.Tools.Utils` | Standard tool catalog, meta-tools, REST client, local ops |
+| `Gemma4.HNSW` | HNSW approximate nearest-neighbor vector index |
+| `Gemma4.Memory` | SQLite conversation archive (FTS5 + HNSW retrieval) |
+| `Gemma4.Session` | Conversation policy, recall, tool loop, infinite memory |
+| `Gemma4.Chat` | Abstract interactive chat loop + console frontend |
 
 ## 🔨 Building from Source
 
@@ -207,14 +297,17 @@ Join our [Discord](https://discord.gg/Wb6z8Wam7p) to discuss development, ask qu
 
 If Gemma4.pas saves you time, sparks an idea, or becomes part of something you ship:
 
-- **Star the repo** -- helps others find the project
-- **Spread the word** -- write a post, mention it on social media
-- **Join us on [Discord](https://discord.gg/Wb6z8Wam7p)** -- share what you are building
-- **Become a sponsor** via [GitHub Sponsors](https://github.com/sponsors/tinyBigGAMES) -- directly funds development
+- :star: **Star the repo**: it costs nothing and helps others find the project
+- :speech_balloon: **Spread the word**: write a post, mention it in a community you are part of
+- :busts_in_silhouette: **[Join us on Discord](https://discord.gg/Wb6z8Wam7p)**: share what you are building and help shape what comes next
+- :sparkling_heart: **[Become a sponsor](https://github.com/sponsors/tinyBigGAMES)**: sponsorship directly funds development and documentation
+- :butterfly: **[Follow on Bluesky](https://bsky.app/profile/tinybiggames.com)**: stay in the loop on releases and development
 
 ## 📄 License
 
 Gemma4.pas is licensed under the **Apache License 2.0**. See [LICENSE](https://github.com/tinyBigGAMES/Gemma4.pas?tab=License-1-ov-file#) for details.
+
+Apache 2.0 is a permissive open source license that lets you use, modify, and distribute StdApp freely in both open source and commercial projects. You are not required to release your own source code. The license includes an explicit patent grant. Attribution is required; keep the copyright notice and license file in place.
 
 ## 🔗 Links
 
